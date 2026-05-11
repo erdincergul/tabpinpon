@@ -2,8 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
-
-export const isSupabaseConfigured = !!(supabaseUrl && supabaseAnonKey && supabaseUrl.startsWith('https://'));
+export const isSupabaseConfigured = !!(supabaseUrl && supabaseAnonKey && supabaseUrl.startsWith('http'));
 
 export const supabase = isSupabaseConfigured
   ? createClient(supabaseUrl, supabaseAnonKey, {
@@ -14,7 +13,7 @@ export const supabase = isSupabaseConfigured
 // ─── Teams ──────────────────────────────────────────
 export async function dbGetTeams() {
   if (!supabase) return null;
-  const { data, error } = await supabase.from('teams').select('*').order('created_at');
+  const { data, error } = await supabase.from('teams').select('*').order('name');
   if (error) throw error;
   return data;
 }
@@ -36,7 +35,7 @@ export async function dbDeleteTeam(teamId) {
 // ─── Players ────────────────────────────────────────
 export async function dbGetPlayers() {
   if (!supabase) return null;
-  const { data, error } = await supabase.from('players').select('*').order('display_order');
+  const { data, error } = await supabase.from('players').select('*').order('name');
   if (error) throw error;
   return data;
 }
@@ -44,12 +43,8 @@ export async function dbGetPlayers() {
 export async function dbUpsertPlayer(player) {
   if (!supabase) return;
   const { error } = await supabase.from('players').upsert({
-    id: player.id,
-    team_id: player.teamId,
-    name: player.name,
-    photo: player.photo || '',
-    rank: player.rank || 'B',
-    display_order: player.displayOrder || 0
+    id: player.id, team_id: player.teamId, name: player.name,
+    photo: player.photo || '', rank: player.rank || 'B', display_order: player.displayOrder || 0
   });
   if (error) throw error;
 }
@@ -63,6 +58,12 @@ export async function dbDeletePlayer(playerId) {
 // ─── Matches ────────────────────────────────────────
 export async function dbGetMatches() {
   if (!supabase) return null;
+  // Try ordering by match_date, fall back to created_at
+  let q = supabase.from('matches').select('*');
+  try {
+    const { data, error } = await q.order('match_date', { ascending: true, nullsFirst: false });
+    if (!error) return data;
+  } catch(_) {}
   const { data, error } = await supabase.from('matches').select('*');
   if (error) throw error;
   return data;
@@ -70,51 +71,49 @@ export async function dbGetMatches() {
 
 export async function dbUpsertMatch(match) {
   if (!supabase) return;
-  const { error } = await supabase.from('matches').upsert({
-    id: match.id,
-    team_a_id: match.teamAId,
-    team_b_id: match.teamBId,
-    player_a_id: match.playerAId,
-    player_b_id: match.playerBId,
-    sets: match.sets || [],
-    sets_a: match.setA || 0,
-    sets_b: match.setB || 0,
-    points_a: match.pointsA || 0,
-    points_b: match.pointsB || 0,
-    played: match.played || false
-  });
+  const row = {
+    id: match.id, team_a_id: match.teamAId, team_b_id: match.teamBId,
+    player_a_id: match.playerAId, player_b_id: match.playerBId,
+    sets: match.sets || [], sets_a: match.setA || 0, sets_b: match.setB || 0,
+    points_a: match.pointsA || 0, points_b: match.pointsB || 0, played: match.played || false
+  };
+  // Try with match_date first, fall back without it
+  if (match.matchDate !== undefined) {
+    const rowWithDate = { ...row, match_date: match.matchDate || null };
+    const { error } = await supabase.from('matches').upsert(rowWithDate);
+    if (!error) return;
+    // If error (column doesn't exist), fall through to upsert without date
+  }
+  const { error } = await supabase.from('matches').upsert(row);
   if (error) throw error;
 }
 
 export async function dbInsertMatches(matchList) {
   if (!supabase) return;
-  const rows = matchList.map(m => ({
-    id: m.id,
-    team_a_id: m.teamAId,
-    team_b_id: m.teamBId,
-    player_a_id: m.playerAId,
-    player_b_id: m.playerBId,
-    sets: m.sets || [],
-    sets_a: m.setA || 0,
-    sets_b: m.setB || 0,
-    points_a: m.pointsA || 0,
-    points_b: m.pointsB || 0,
-    played: false
+  const baseRows = matchList.map(m => ({
+    id: m.id, team_a_id: m.teamAId, team_b_id: m.teamBId,
+    player_a_id: m.playerAId, player_b_id: m.playerBId,
+    sets: [], sets_a: 0, sets_b: 0, points_a: 0, points_b: 0, played: false
   }));
+  const rowsWithDate = matchList.map((m, i) => ({ ...baseRows[i], match_date: m.matchDate || null }));
   // Insert in chunks of 100
-  for (let i = 0; i < rows.length; i += 100) {
-    const { error } = await supabase.from('matches').insert(rows.slice(i, i + 100));
-    if (error) throw error;
+  for (let i = 0; i < rowsWithDate.length; i += 100) {
+    const { error } = await supabase.from('matches').insert(rowsWithDate.slice(i, i + 100));
+    if (error) {
+      // If column missing, retry without match_date
+      if (error.message && error.message.includes('match_date')) {
+        const { error: e2 } = await supabase.from('matches').insert(baseRows.slice(i, i + 100));
+        if (e2) throw e2;
+      } else { throw error; }
+    }
   }
 }
 
 export async function dbDeleteAllMatches() {
   if (!supabase) return;
-  // Delete all rows - use a filter that matches everything
-  const { error } = await supabase.from('matches').delete().gte('sets_a', -1);
+  const { error } = await supabase.from('matches').delete().not('id', 'is', null);
   if (error) {
-    // fallback: delete where played is true or false
-    const { error: e2 } = await supabase.from('matches').delete().not('id', 'is', null);
+    const { error: e2 } = await supabase.from('matches').delete().gte('sets_a', 0);
     if (e2) throw e2;
   }
 }
@@ -138,4 +137,4 @@ export function subscribeToChanges(onTeams, onPlayers, onMatches) {
     .subscribe();
   return () => supabase.removeChannel(channel);
 }
-// v2 - Supabase realtime enabled
+// v4 - match_date with graceful fallback
