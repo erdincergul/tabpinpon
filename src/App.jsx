@@ -130,10 +130,12 @@ function fmtDate(d) {
   if (isNaN(dt)) return d;
   return dt.toLocaleDateString('tr-TR', { day:'2-digit', month:'2-digit', year:'numeric' });
 }
-function Avatar({ src, name, color, size = 8 }) {
+function Avatar({ src, name, color, size = 8, square = false }) {
   const px = size * 4;
-  const style = { width: px, height: px, borderRadius: '50%', flexShrink: 0, overflow: 'hidden', display: 'inline-block' };
-  if (src) return <span style={style}><img src={src} style={{width:'100%',height:'100%',objectFit:'cover',objectPosition:'center',display:'block'}}/></span>;
+  const radius = square ? '8px' : '50%';
+  const fit = square ? 'contain' : 'cover';
+  const style = { width: px+'px', height: px+'px', borderRadius: radius, overflow: 'hidden', display: 'flex', flexShrink: 0 };
+  if (src) return <span style={style}><img src={src} style={{width:'100%',height:'100%',objectFit:fit,objectPosition:'center',display:'block'}}/></span>;
   return <span style={{...style, background: color||'#999', display:'inline-flex', alignItems:'center', justifyContent:'center', color:'white', fontWeight:'bold', fontSize: Math.max(10, px/3)}}>{(name||'?')[0].toUpperCase()}</span>;
 }
 
@@ -452,7 +454,7 @@ function StandingsTab({ standings, teams, matches, isAdmin, onGenerate, onReset 
                 <td className="px-4 py-3 text-gray-400 font-bold">{i+1}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
-                    <Avatar src={t.logo} name={t.name} color={t.color} size={7}/>
+                    <Avatar src={t.logo} name={t.name} color={t.color} size={7} square={true}/>
                     <span className="font-medium text-gray-800">{t.name}</span>
                   </div>
                 </td>
@@ -647,7 +649,7 @@ function SquadsTab({ teams, isAdmin, onEditTeam, onEditPlayer, onAddPlayer, onRe
           <div key={t.id} className="bg-white rounded-xl border border-amber-100 shadow-sm overflow-hidden">
             <div className="flex items-center justify-between px-5 py-4 border-b border-amber-50" style={{borderLeftWidth:4,borderLeftColor:t.color}}>
               <div className="flex items-center gap-3">
-                <Avatar src={t.logo} name={t.name} color={t.color} size={10}/>
+                <Avatar src={t.logo} name={t.name} color={t.color} size={10} square={true}/>
                 <div><div className="font-bold text-gray-800 text-lg">{t.name}</div><div className="text-xs text-gray-400">{t.players.length} oyuncu</div></div>
               </div>
               {isAdmin && <div className="flex gap-2">
