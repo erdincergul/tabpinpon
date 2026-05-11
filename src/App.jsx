@@ -4,6 +4,7 @@ import { isSupabaseConfigured, dbGetTeams, dbGetPlayers, dbGetMatches,
   dbResetMatchResults, dbUpsertMatch, subscribeToChanges } from './supabase.js';
 
 const STORAGE_KEY = 'tabpinpon_v5';
+const DATES_KEY = 'tabpinpon_dates';
 const ADMIN_PW = 'Admin2026Tab2026';
 const RANKS = ['A', 'B', 'C', 'D'];
 const RANK_COLORS = { A: 'bg-red-100 text-red-700', B: 'bg-blue-100 text-blue-700', C: 'bg-green-100 text-green-700', D: 'bg-purple-100 text-purple-700' };
@@ -40,6 +41,13 @@ const DEFAULT_TEAMS = [
 ];
 
 function genId() { return Math.random().toString(36).slice(2,9) + Date.now().toString(36); }
+
+// Dates are stored separately in localStorage so they survive Supabase reloads
+function loadDates() { try { return JSON.parse(localStorage.getItem(DATES_KEY)||'{}'); } catch { return {}; } }
+function saveDates(d) { try { localStorage.setItem(DATES_KEY, JSON.stringify(d)); } catch {} }
+function mergeDates(matches, dates) {
+  return matches.map(m => ({ ...m, matchDate: dates[m.id] || m.matchDate || null }));
+}
 
 function generateFixtures(teams) {
   const byRank = {};
@@ -95,7 +103,8 @@ function saveLocal(teams, matches) {
 function mapDbMatch(m) {
   return { id: m.id, teamAId: m.team_a_id, teamBId: m.team_b_id, playerAId: m.player_a_id,
     playerBId: m.player_b_id, sets: m.sets || [], setA: m.sets_a || 0, setB: m.sets_b || 0,
-    pointsA: m.points_a || 0, pointsB: m.points_b || 0, played: m.played || false, matchDate: m.match_date || null };
+    pointsA: m.points_a || 0, pointsB: m.points_b || 0, played: m.played || false,
+    matchDate: m.match_date || null };
 }
 function compressImage(file, maxW = 400) {
   return new Promise(res => {
@@ -121,16 +130,17 @@ function fmtDate(d) {
   if (isNaN(dt)) return d;
   return dt.toLocaleDateString('tr-TR', { day:'2-digit', month:'2-digit', year:'numeric' });
 }
-// Avatar helper - square crop to circle
 function Avatar({ src, name, color, size = 8 }) {
-  const sClass = 'w-' + size + ' h-' + size;
-  if (src) return <img src={src} className={sClass + ' rounded-full object-cover object-center flex-shrink-0'} style={{aspectRatio:'1/1'}} />;
-  return <div className={sClass + ' rounded-full flex items-center justify-center text-white font-bold flex-shrink-0 text-sm'} style={{background: color || '#999', aspectRatio:'1/1'}}>{(name||'?')[0].toUpperCase()}</div>;
+  const px = size * 4;
+  const style = { width: px, height: px, borderRadius: '50%', flexShrink: 0, overflow: 'hidden', display: 'inline-block' };
+  if (src) return <span style={style}><img src={src} style={{width:'100%',height:'100%',objectFit:'cover',objectPosition:'center',display:'block'}}/></span>;
+  return <span style={{...style, background: color||'#999', display:'inline-flex', alignItems:'center', justifyContent:'center', color:'white', fontWeight:'bold', fontSize: Math.max(10, px/3)}}>{(name||'?')[0].toUpperCase()}</span>;
 }
 
 export default function App() {
   const [teams, setTeams] = useState([]);
   const [matches, setMatches] = useState([]);
+  const [dates, setDates] = useState(loadDates);
   const [tab, setTab] = useState('standings');
   const [isAdmin, setIsAdmin] = useState(false);
   const [pw, setPw] = useState('');
@@ -142,6 +152,7 @@ export default function App() {
   const [editPlayer, setEditPlayer] = useState(null);
   const [editTeam, setEditTeam] = useState(null);
   const [addPlayerTeamId, setAddPlayerTeamId] = useState(null);
+  const [addTeam, setAddTeam] = useState(false);
   const [filterRank, setFilterRank] = useState('all');
   const [filterTeam, setFilterTeam] = useState('all');
   const [filterDate, setFilterDate] = useState('');
@@ -156,8 +167,14 @@ export default function App() {
         id: t.id, name: t.name, color: t.color, logo: t.logo || '',
         players: playersData.filter(p => p.team_id === t.id).map(p => ({ id: p.id, name: p.name, photo: p.photo || '', rank: p.rank || 'B' }))
       }));
-      const mergedMatches = matchesData.map(mapDbMatch);
-      setTeams(mergedTeams); setMatches(mergedMatches);
+      // Merge dates from localStorage (in case match_date column missing in DB)
+      const storedDates = loadDates();
+      const mergedMatches = matchesData.map(m => {
+        const mapped = mapDbMatch(m);
+        return { ...mapped, matchDate: storedDates[mapped.id] || mapped.matchDate || null };
+      });
+      setTeams(mergedTeams);
+      setMatches(mergedMatches);
       saveLocal(mergedTeams, mergedMatches);
       return true;
     } catch (e) { console.error('Supabase load error:', e); return false; }
@@ -167,8 +184,8 @@ export default function App() {
     async function init() {
       if (isSupabaseConfigured) {
         const ok = await loadFromSupabase();
-        if (!ok) { const local = loadLocal(); setTeams(local.teams); setMatches(local.matches); }
-      } else { const local = loadLocal(); setTeams(local.teams); setMatches(local.matches); }
+        if (!ok) { const local = loadLocal(); setTeams(local.teams); setMatches(mergeDates(local.matches, loadDates())); }
+      } else { const local = loadLocal(); setTeams(local.teams); setMatches(mergeDates(local.matches, loadDates())); }
       setLoading(false);
     }
     init();
@@ -184,15 +201,19 @@ export default function App() {
     if (!isSupabaseConfigured && teams.length > 0) saveLocal(teams, matches);
   }, [teams, matches]);
 
+  // Persist dates to localStorage whenever they change
+  useEffect(() => { saveDates(dates); }, [dates]);
+
   function login() {
     if (pw === ADMIN_PW) { setIsAdmin(true); setPwError(false); setPw(''); }
     else { setPwError(true); }
   }
 
   function calcStandings() {
+    const displayMatches = mergeDates(matches, dates);
     return teams.map(t => {
       let W=0,L=0,SA=0,SB=0,PA=0,PB=0;
-      const tm = matches.filter(m => m.played && (m.teamAId===t.id||m.teamBId===t.id));
+      const tm = displayMatches.filter(m => m.played && (m.teamAId===t.id||m.teamBId===t.id));
       tm.forEach(m => {
         const isA=m.teamAId===t.id;
         const ws=isA?m.setA:m.setB, ls=isA?m.setB:m.setA;
@@ -206,9 +227,10 @@ export default function App() {
   }
 
   function calcPlayerStats() {
+    const displayMatches = mergeDates(matches, dates);
     return teams.flatMap(t => t.players.map(p => {
       let W=0,L=0,SA=0,SB=0,PA=0,PB=0;
-      const pm = matches.filter(m => m.played && (m.playerAId===p.id||m.playerBId===p.id));
+      const pm = displayMatches.filter(m => m.played && (m.playerAId===p.id||m.playerBId===p.id));
       pm.forEach(m => {
         const isA=m.playerAId===p.id;
         const ws=isA?m.setA:m.setB, ls=isA?m.setB:m.setA;
@@ -246,23 +268,37 @@ export default function App() {
   async function handleSaveMatch(matchId, sets, matchDate) {
     const sA = sets.filter(s=>+s.a>+s.b).length, sB = sets.filter(s=>+s.b>+s.a).length;
     const pA = sets.reduce((s,x)=>s+(+x.a||0),0), pB = sets.reduce((s,x)=>s+(+x.b||0),0);
-    const updated = { ...matches.find(m=>m.id===matchId), sets, setA:sA, setB:sB, pointsA:pA, pointsB:pB, played:true, matchDate:matchDate||null };
+    const existing = matches.find(m=>m.id===matchId) || {};
+    const updated = { ...existing, sets, setA:sA, setB:sB, pointsA:pA, pointsB:pB, played:true, matchDate:matchDate||existing.matchDate||null };
+    // Always save date to localStorage dates map
+    if (matchDate) {
+      const newDates = { ...dates, [matchId]: matchDate };
+      setDates(newDates); saveDates(newDates);
+    }
+    // Update local state immediately (before Supabase reload)
+    setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
     if (isSupabaseConfigured) {
       try { await dbUpsertMatch(updated); } catch(e) { flash('Hata: ' + e.message); return; }
-      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
-    } else {
-      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
+      // Reload from Supabase but merge dates after
+      await loadFromSupabase();
     }
     setEditMatch(null); flash('Mac kaydedildi!');
   }
 
   async function handleSaveDate(matchId, matchDate) {
-    const updated = { ...matches.find(m=>m.id===matchId), matchDate: matchDate||null };
+    // Save date to localStorage dates map immediately
+    const newDates = matchDate
+      ? { ...dates, [matchId]: matchDate }
+      : Object.fromEntries(Object.entries(dates).filter(([k]) => k !== matchId));
+    setDates(newDates); saveDates(newDates);
+    // Update local match state immediately
+    setMatches(prev => prev.map(m => m.id===matchId ? {...m, matchDate: matchDate||null} : m));
+    // Also try to save to Supabase (will silently fail if column missing)
     if (isSupabaseConfigured) {
-      try { await dbUpsertMatch(updated); } catch(e) { flash('Hata: ' + e.message); return; }
-      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
-    } else {
-      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
+      const existing = matches.find(m=>m.id===matchId);
+      if (existing) {
+        try { await dbUpsertMatch({...existing, matchDate: matchDate||null}); } catch(e) { /* ignore column missing error */ }
+      }
     }
     setEditDateMatch(null); flash('Tarih kaydedildi!');
   }
@@ -309,8 +345,20 @@ export default function App() {
     setEditTeam(null); flash('Takim guncellendi!');
   }
 
+  async function handleAddTeam(team) {
+    const newTeam = { ...team, id: genId(), players: [] };
+    if (isSupabaseConfigured) {
+      try { await dbUpsertTeam(newTeam); } catch(e) { flash('Hata: ' + e.message); return; }
+      await loadFromSupabase();
+    } else {
+      setTeams(prev => [...prev, newTeam]);
+    }
+    setAddTeam(false); flash('Takim eklendi!');
+  }
+
   const standings = calcStandings();
   const playerStats = calcPlayerStats();
+  const displayMatches = mergeDates(matches, dates);
 
   if (loading) return (
     <div className="min-h-screen bg-amber-50 flex items-center justify-center">
@@ -358,16 +406,17 @@ export default function App() {
       </div>
 
       <main className="max-w-5xl mx-auto px-4 py-6">
-        {tab==='standings' && <StandingsTab standings={standings} teams={teams} matches={matches} isAdmin={isAdmin} onGenerate={handleGenerateFixtures} onReset={handleResetAll}/>}
-        {tab==='matches' && <MatchesTab teams={teams} matches={matches} isAdmin={isAdmin} onEdit={setEditMatch} onEditDate={setEditDateMatch} filterRank={filterRank} setFilterRank={setFilterRank} filterTeam={filterTeam} setFilterTeam={setFilterTeam} filterDate={filterDate} setFilterDate={setFilterDate}/>}
+        {tab==='standings' && <StandingsTab standings={standings} teams={teams} matches={displayMatches} isAdmin={isAdmin} onGenerate={handleGenerateFixtures} onReset={handleResetAll}/>}
+        {tab==='matches' && <MatchesTab teams={teams} matches={displayMatches} isAdmin={isAdmin} onEdit={setEditMatch} onEditDate={setEditDateMatch} filterRank={filterRank} setFilterRank={setFilterRank} filterTeam={filterTeam} setFilterTeam={setFilterTeam} filterDate={filterDate} setFilterDate={setFilterDate}/>}
         {tab==='players' && <PlayersTab playerStats={playerStats} teams={teams} isAdmin={isAdmin} onEdit={setEditPlayer}/>}
-        {tab==='squads' && <SquadsTab teams={teams} isAdmin={isAdmin} onEditTeam={setEditTeam} onEditPlayer={setEditPlayer} onAddPlayer={setAddPlayerTeamId} onRemovePlayer={handleRemovePlayer}/>}
+        {tab==='squads' && <SquadsTab teams={teams} isAdmin={isAdmin} onEditTeam={setEditTeam} onEditPlayer={setEditPlayer} onAddPlayer={setAddPlayerTeamId} onRemovePlayer={handleRemovePlayer} onAddTeam={()=>setAddTeam(true)}/>}
       </main>
 
       {editMatch && <MatchModal match={editMatch} teams={teams} onSave={handleSaveMatch} onClose={()=>setEditMatch(null)}/>}
       {editDateMatch && <DateModal match={editDateMatch} onSave={handleSaveDate} onClose={()=>setEditDateMatch(null)}/>}
       {editPlayer && <PlayerModal player={editPlayer} teams={teams} onSave={handleSavePlayer} onClose={()=>setEditPlayer(null)}/>}
       {editTeam && <TeamModal team={editTeam} onSave={handleSaveTeam} onClose={()=>setEditTeam(null)}/>}
+      {addTeam && <TeamModal team={{id:'',name:'',color:'#3b82f6',logo:''}} isNew onSave={handleAddTeam} onClose={()=>setAddTeam(false)}/>}
       {addPlayerTeamId && <AddPlayerModal teamId={addPlayerTeamId} onSave={handleAddPlayer} onClose={()=>setAddPlayerTeamId(null)}/>}
     </div>
   );
@@ -465,16 +514,18 @@ function MatchesTab({ teams, matches, isAdmin, onEdit, onEditDate, filterRank, s
           <option value="all">Tum Takimlar</option>
           {teams.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
         </select>
-        <input type="date" value={filterDate} onChange={e=>setFilterDate(e.target.value)}
-          className="border border-gray-200 rounded px-3 py-1.5 text-sm bg-white"/>
-        {filterDate && <button onClick={()=>setFilterDate('')} className="text-xs text-gray-400 hover:text-gray-600 underline">Temizle</button>}
+        <div className="flex items-center gap-2">
+          <input type="date" value={filterDate} onChange={e=>setFilterDate(e.target.value)}
+            className="border border-gray-200 rounded px-3 py-1.5 text-sm bg-white"/>
+          {filterDate && <button onClick={()=>setFilterDate('')} className="text-xs text-gray-400 hover:text-gray-600 underline">Temizle</button>}
+        </div>
         <span className="text-sm text-gray-400">{filtered.filter(m=>m.played).length}/{filtered.length} oynandi</span>
       </div>
 
       {dateKeys.map(dateKey => (
         <div key={dateKey} className="mb-8">
           <div className="flex items-center gap-2 mb-3">
-            <span className="text-sm font-bold text-gray-600 bg-white border border-gray-200 px-3 py-1 rounded-full shadow-sm">
+            <span className="text-sm font-semibold text-gray-600 bg-white border border-gray-200 px-3 py-1 rounded-full shadow-sm">
               {dateKey === '__nodate__' ? 'Tarih Belirlenmemis' : ('📅 ' + fmtDate(dateKey))}
             </span>
             <span className="text-xs text-gray-400">{byDate[dateKey].filter(m=>m.played).length}/{byDate[dateKey].length}</span>
@@ -510,8 +561,10 @@ function MatchesTab({ teams, matches, isAdmin, onEdit, onEditDate, filterRank, s
                     </div>
                     {isAdmin && (
                       <div className="flex gap-1 shrink-0 ml-1">
-                        <button onClick={e=>{e.stopPropagation();onEditDate(m);}} title="Tarih gir" className="text-blue-400 hover:text-blue-600 hover:bg-blue-50 rounded p-1 text-sm">📅</button>
-                        <button onClick={e=>{e.stopPropagation();onEdit(m);}} title="Skor gir" className="text-amber-400 hover:text-amber-600 hover:bg-amber-50 rounded p-1 text-sm">✏️</button>
+                        <button onClick={e=>{e.stopPropagation();onEditDate(m);}} title="Tarih gir"
+                          className={"text-sm px-2 py-1 rounded border " + (m.matchDate ? 'bg-blue-50 border-blue-200 text-blue-600' : 'bg-gray-50 border-gray-200 text-gray-400')}>📅</button>
+                        <button onClick={e=>{e.stopPropagation();onEdit(m);}} title="Skor gir"
+                          className={"text-sm px-2 py-1 rounded border " + (m.played ? 'bg-green-50 border-green-200 text-green-600' : 'bg-amber-50 border-amber-200 text-amber-500')}>✏️</button>
                       </div>
                     )}
                   </div>
@@ -536,9 +589,7 @@ function PlayersTab({ playerStats, teams, isAdmin, onEdit }) {
   });
   return (
     <div>
-      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-        <h2 className="text-xl font-bold text-gray-800">Oyuncu Istatistikleri</h2>
-      </div>
+      <h2 className="text-xl font-bold text-gray-800 mb-4">Oyuncu Istatistikleri</h2>
       <div className="flex gap-3 mb-4 flex-wrap">
         <select value={rankFilter} onChange={e=>setRankFilter(e.target.value)} className="border border-gray-200 rounded px-3 py-1.5 text-sm bg-white">
           <option value="all">Tum Klasmanlar</option>
@@ -567,10 +618,7 @@ function PlayersTab({ playerStats, teams, isAdmin, onEdit }) {
                 <td className="px-4 py-2.5">
                   <div className="flex items-center gap-2">
                     <Avatar src={p.photo} name={p.name} color={p.teamColor} size={9}/>
-                    <div>
-                      <div className="font-medium text-gray-800">{p.name}</div>
-                      <div className="text-xs text-gray-400">{p.teamName}</div>
-                    </div>
+                    <div><div className="font-medium text-gray-800">{p.name}</div><div className="text-xs text-gray-400">{p.teamName}</div></div>
                   </div>
                 </td>
                 <td className="text-center px-2 py-2.5"><span className={"text-xs px-1.5 py-0.5 rounded-full font-bold " + (RANK_COLORS[p.rank]||'bg-gray-200')}>{p.rank||'-'}</span></td>
@@ -587,10 +635,13 @@ function PlayersTab({ playerStats, teams, isAdmin, onEdit }) {
   );
 }
 
-function SquadsTab({ teams, isAdmin, onEditTeam, onEditPlayer, onAddPlayer, onRemovePlayer }) {
+function SquadsTab({ teams, isAdmin, onEditTeam, onEditPlayer, onAddPlayer, onRemovePlayer, onAddTeam }) {
   return (
     <div>
-      <h2 className="text-xl font-bold text-gray-800 mb-4">Kadrolar</h2>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-xl font-bold text-gray-800">Kadrolar</h2>
+        {isAdmin && <button onClick={onAddTeam} className="bg-blue-500 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-600 font-medium">+ Yeni Takim</button>}
+      </div>
       <div className="space-y-6">
         {teams.map(t => (
           <div key={t.id} className="bg-white rounded-xl border border-amber-100 shadow-sm overflow-hidden">
@@ -601,7 +652,7 @@ function SquadsTab({ teams, isAdmin, onEditTeam, onEditPlayer, onAddPlayer, onRe
               </div>
               {isAdmin && <div className="flex gap-2">
                 <button onClick={()=>onEditTeam(t)} className="bg-blue-50 text-blue-600 px-3 py-1.5 rounded text-sm hover:bg-blue-100 font-medium">✏️ Duzenle</button>
-                <button onClick={()=>onAddPlayer(t.id)} className="bg-green-50 text-green-600 px-3 py-1.5 rounded text-sm hover:bg-green-100 font-medium">+ Ekle</button>
+                <button onClick={()=>onAddPlayer(t.id)} className="bg-green-50 text-green-600 px-3 py-1.5 rounded text-sm hover:bg-green-100 font-medium">+ Oyuncu Ekle</button>
               </div>}
             </div>
             <div className="p-4">
@@ -636,30 +687,30 @@ function DateModal({ match, onSave, onClose }) {
     await onSave(match.id, matchDate);
     setSaving(false);
   }
+  async function handleClear() {
+    setSaving(true);
+    await onSave(match.id, '');
+    setSaving(false);
+  }
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-xs" onClick={e=>e.stopPropagation()}>
         <div className="p-6">
           <h3 className="text-lg font-bold text-gray-800 mb-1">Mac Tarihi</h3>
-          <p className="text-xs text-gray-400 mb-5">Skoru daha sonra girebilirsiniz</p>
-          <div className="mb-6">
-            <label className="text-sm font-medium text-gray-600 block mb-2">Tarih Sec</label>
+          <p className="text-xs text-gray-400 mb-5">Sadece tarih girin, skoru sonra girebilirsiniz</p>
+          <div className="mb-4">
             <input type="date" value={matchDate} onChange={e=>setMatchDate(e.target.value)}
-              className="border rounded-xl px-3 py-3 w-full text-sm focus:border-amber-400 focus:outline-none text-center text-lg"/>
+              className="border-2 rounded-xl px-3 py-3 w-full text-base focus:border-amber-400 focus:outline-none" autoFocus/>
           </div>
-          {matchDate && (
-            <p className="text-center text-amber-600 font-medium text-sm mb-4">{fmtDate(matchDate)}</p>
-          )}
+          {matchDate && <p className="text-center text-amber-600 font-medium text-sm mb-4">📅 {fmtDate(matchDate)}</p>}
           <div className="flex gap-3">
             <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl hover:bg-gray-50">Iptal</button>
-            <button onClick={handleSave} disabled={saving} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">
+            <button onClick={handleSave} disabled={saving||!matchDate} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">
               {saving?'Kaydediliyor...':'Kaydet'}
             </button>
           </div>
-          {match.matchDate && (
-            <button onClick={async()=>{setSaving(true);await onSave(match.id,'');}} className="w-full mt-2 text-xs text-red-400 hover:text-red-600 py-1">Tarihi kaldir</button>
-          )}
+          {match.matchDate && <button onClick={handleClear} className="w-full mt-2 text-xs text-red-400 hover:text-red-600 py-1">Tarihi kaldir</button>}
         </div>
       </div>
     </div>
@@ -695,25 +746,21 @@ function MatchModal({ match, teams, onSave, onClose }) {
           <h3 className="text-lg font-bold text-gray-800 mb-4">Mac Sonucu Gir</h3>
           <div className="flex items-center justify-between mb-4">
             <div className="text-center flex-1">
-              <div className="flex justify-center mb-1">
-                <Avatar src={pA.photo} name={pA.name} color={tA.color||'#999'} size={12}/>
-              </div>
+              <div className="flex justify-center mb-1"><Avatar src={pA.photo} name={pA.name} color={tA.color||'#999'} size={12}/></div>
               <div className="font-semibold text-sm">{pA.name}</div>
               <div className="text-xs text-gray-400">{tA.name}</div>
               <div className={"text-3xl font-bold mt-1 " + (setA>setB?'text-green-500':setA<setB?'text-red-400':'text-gray-400')}>{setA}</div>
             </div>
             <div className="text-gray-200 text-2xl mx-2">vs</div>
             <div className="text-center flex-1">
-              <div className="flex justify-center mb-1">
-                <Avatar src={pB.photo} name={pB.name} color={tB.color||'#999'} size={12}/>
-              </div>
+              <div className="flex justify-center mb-1"><Avatar src={pB.photo} name={pB.name} color={tB.color||'#999'} size={12}/></div>
               <div className="font-semibold text-sm">{pB.name}</div>
               <div className="text-xs text-gray-400">{tB.name}</div>
               <div className={"text-3xl font-bold mt-1 " + (setB>setA?'text-green-500':setB<setA?'text-red-400':'text-gray-400')}>{setB}</div>
             </div>
           </div>
           <div className="mb-4">
-            <label className="text-sm font-medium text-gray-600 block mb-1">Mac Tarihi (opsiyonel)</label>
+            <label className="text-xs font-medium text-gray-500 block mb-1">Tarih (opsiyonel)</label>
             <input type="date" value={matchDate} onChange={e=>setMatchDate(e.target.value)}
               className="border rounded-xl px-3 py-2 w-full text-sm focus:border-amber-400 focus:outline-none"/>
           </div>
@@ -726,16 +773,14 @@ function MatchModal({ match, teams, onSave, onClose }) {
                 <span className="text-gray-300 font-bold">—</span>
                 <input type="number" value={s.b} onChange={e=>setVal(i,'b',e.target.value)} min="0" placeholder="0"
                   className="border rounded-lg px-2 py-2 w-16 text-center text-sm focus:border-amber-400 focus:outline-none"/>
-                {sets.length > 2 && <button onClick={()=>removeSet(i)} className="text-red-400 hover:text-red-600 text-xs ml-1">x</button>}
+                {sets.length > 2 && <button onClick={()=>removeSet(i)} className="text-red-400 text-xs ml-1">x</button>}
               </div>
             ))}
             <button onClick={addSet} className="text-amber-500 text-sm hover:text-amber-700 font-medium mt-1">+ Set Ekle</button>
           </div>
           <div className="flex gap-3">
             <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl hover:bg-gray-50">Iptal</button>
-            <button onClick={handleSave} disabled={saving} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">
-              {saving?'Kaydediliyor...':'Kaydet'}
-            </button>
+            <button onClick={handleSave} disabled={saving} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">{saving?'Kaydediliyor...':'Kaydet'}</button>
           </div>
         </div>
       </div>
@@ -770,13 +815,13 @@ function PlayerModal({ player, teams, onSave, onClose }) {
           <h3 className="text-lg font-bold text-gray-800 mb-4">Oyuncu Duzenle</h3>
           <div className="flex flex-col items-center mb-5">
             <div className="relative cursor-pointer" onClick={()=>fileRef.current?.click()}>
-              <div className="w-24 h-24 rounded-full overflow-hidden border-4 border-amber-200 flex-shrink-0" style={{width:96,height:96}}>
+              <div style={{width:96,height:96,borderRadius:'50%',overflow:'hidden',border:'4px solid #fde68a',flexShrink:0}}>
                 {photo
                   ? <img src={photo} style={{width:'100%',height:'100%',objectFit:'cover',objectPosition:'center',display:'block'}}/>
                   : <div style={{width:'100%',height:'100%',background:teamColor,display:'flex',alignItems:'center',justifyContent:'center',fontSize:36,fontWeight:'bold',color:'white'}}>{(name||'?')[0].toUpperCase()}</div>
                 }
               </div>
-              <div className="absolute bottom-1 right-1 bg-amber-500 text-white rounded-full w-7 h-7 flex items-center justify-center shadow text-sm">📷</div>
+              <div className="absolute bottom-0 right-0 bg-amber-500 text-white rounded-full w-7 h-7 flex items-center justify-center shadow text-sm">📷</div>
             </div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFile}/>
             <span className="text-xs text-gray-400 mt-2">Fotograf eklemek icin tikla</span>
@@ -786,12 +831,12 @@ function PlayerModal({ player, teams, onSave, onClose }) {
               <input value={name} onChange={e=>setName(e.target.value)} className="border rounded-xl px-3 py-2 w-full text-sm focus:border-amber-400 focus:outline-none"/></div>
             <div><label className="text-sm font-medium text-gray-600 block mb-1">Klasman</label>
               <div className="flex gap-2">{RANKS.map(r=>(
-                <button key={r} onClick={()=>setRank(r)} className={"flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all " + (rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400 hover:border-gray-300')}>{r}</button>
+                <button key={r} onClick={()=>setRank(r)} className={"flex-1 py-2 rounded-xl text-sm font-bold border-2 " + (rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400')}>{r}</button>
               ))}</div>
             </div>
           </div>
           <div className="flex gap-3 mt-5">
-            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl hover:bg-gray-50">Iptal</button>
+            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl">Iptal</button>
             <button onClick={handleSave} disabled={saving} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">{saving?'Kaydediliyor...':'Kaydet'}</button>
           </div>
         </div>
@@ -800,9 +845,9 @@ function PlayerModal({ player, teams, onSave, onClose }) {
   );
 }
 
-function TeamModal({ team, onSave, onClose }) {
+function TeamModal({ team, isNew, onSave, onClose }) {
   const [name, setName] = useState(team.name||'');
-  const [color, setColor] = useState(team.color||'#003399');
+  const [color, setColor] = useState(team.color||'#3b82f6');
   const [logo, setLogo] = useState(team.logo||'');
   const [saving, setSaving] = useState(false);
   const fileRef = useRef();
@@ -822,22 +867,23 @@ function TeamModal({ team, onSave, onClose }) {
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm" onClick={e=>e.stopPropagation()}>
         <div className="p-6">
-          <h3 className="text-lg font-bold text-gray-800 mb-4">Takim Duzenle</h3>
+          <h3 className="text-lg font-bold text-gray-800 mb-4">{isNew ? 'Yeni Takim Ekle' : 'Takim Duzenle'}</h3>
           <div className="flex flex-col items-center mb-5">
             <div className="relative cursor-pointer" onClick={()=>fileRef.current?.click()}>
-              <div className="w-24 h-24 rounded-full overflow-hidden border-4 border-blue-200 flex-shrink-0" style={{width:96,height:96}}>
+              <div style={{width:96,height:96,borderRadius:'50%',overflow:'hidden',border:'4px solid #bfdbfe',flexShrink:0}}>
                 {logo
                   ? <img src={logo} style={{width:'100%',height:'100%',objectFit:'cover',objectPosition:'center',display:'block'}}/>
                   : <div style={{width:'100%',height:'100%',background:color,display:'flex',alignItems:'center',justifyContent:'center',fontSize:36,color:'white'}}>🏅</div>
                 }
               </div>
-              <div className="absolute bottom-1 right-1 bg-blue-500 text-white rounded-full w-7 h-7 flex items-center justify-center shadow text-sm">📷</div>
+              <div className="absolute bottom-0 right-0 bg-blue-500 text-white rounded-full w-7 h-7 flex items-center justify-center shadow text-sm">📷</div>
             </div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFile}/>
+            <span className="text-xs text-gray-400 mt-2">Logo eklemek icin tikla</span>
           </div>
           <div className="space-y-4">
             <div><label className="text-sm font-medium text-gray-600 block mb-1">Takim Adi</label>
-              <input value={name} onChange={e=>setName(e.target.value)} className="border rounded-xl px-3 py-2 w-full text-sm focus:border-blue-400 focus:outline-none"/></div>
+              <input value={name} onChange={e=>setName(e.target.value)} placeholder="Takim adi" className="border rounded-xl px-3 py-2 w-full text-sm focus:border-blue-400 focus:outline-none"/></div>
             <div><label className="text-sm font-medium text-gray-600 block mb-1">Renk</label>
               <div className="flex items-center gap-3">
                 <input type="color" value={color} onChange={e=>setColor(e.target.value)} className="w-12 h-10 rounded-lg cursor-pointer border border-gray-200"/>
@@ -846,8 +892,8 @@ function TeamModal({ team, onSave, onClose }) {
             </div>
           </div>
           <div className="flex gap-3 mt-5">
-            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl hover:bg-gray-50">Iptal</button>
-            <button onClick={handleSave} disabled={saving} className="flex-1 bg-blue-500 text-white py-2.5 rounded-xl hover:bg-blue-600 font-medium disabled:opacity-50">{saving?'Kaydediliyor...':'Kaydet'}</button>
+            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl">Iptal</button>
+            <button onClick={handleSave} disabled={saving||!name.trim()} className="flex-1 bg-blue-500 text-white py-2.5 rounded-xl hover:bg-blue-600 font-medium disabled:opacity-50">{saving?'Kaydediliyor...':isNew?'Ekle':'Kaydet'}</button>
           </div>
         </div>
       </div>
@@ -880,13 +926,13 @@ function AddPlayerModal({ teamId, onSave, onClose }) {
           <h3 className="text-lg font-bold text-gray-800 mb-4">Oyuncu Ekle</h3>
           <div className="flex flex-col items-center mb-5">
             <div className="relative cursor-pointer" onClick={()=>fileRef.current?.click()}>
-              <div className="w-24 h-24 rounded-full overflow-hidden border-4 border-dashed border-amber-300 flex-shrink-0" style={{width:96,height:96}}>
+              <div style={{width:96,height:96,borderRadius:'50%',overflow:'hidden',border:'4px dashed #fcd34d',flexShrink:0,background:'#fef3c7',display:'flex',alignItems:'center',justifyContent:'center'}}>
                 {photo
-                  ? <img src={photo} style={{width:'100%',height:'100%',objectFit:'cover',objectPosition:'center',display:'block'}}/>
-                  : <div style={{width:'100%',height:'100%',background:'#fef3c7',display:'flex',alignItems:'center',justifyContent:'center',fontSize:40,color:'#f59e0b'}}>+</div>
+                  ? <img src={photo} style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}}/>
+                  : <span style={{fontSize:40,color:'#f59e0b'}}>+</span>
                 }
               </div>
-              <div className="absolute bottom-1 right-1 bg-amber-500 text-white rounded-full w-7 h-7 flex items-center justify-center shadow text-sm">📷</div>
+              <div className="absolute bottom-0 right-0 bg-amber-500 text-white rounded-full w-7 h-7 flex items-center justify-center shadow text-sm">📷</div>
             </div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFile}/>
           </div>
@@ -895,17 +941,17 @@ function AddPlayerModal({ teamId, onSave, onClose }) {
               <input value={name} onChange={e=>setName(e.target.value)} placeholder="Oyuncu adi" className="border rounded-xl px-3 py-2 w-full text-sm focus:border-amber-400 focus:outline-none"/></div>
             <div><label className="text-sm font-medium text-gray-600 block mb-1">Klasman</label>
               <div className="flex gap-2">{RANKS.map(r=>(
-                <button key={r} onClick={()=>setRank(r)} className={"flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all " + (rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400 hover:border-gray-300')}>{r}</button>
+                <button key={r} onClick={()=>setRank(r)} className={"flex-1 py-2 rounded-xl text-sm font-bold border-2 " + (rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400')}>{r}</button>
               ))}</div>
             </div>
           </div>
           <div className="flex gap-3 mt-5">
-            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl hover:bg-gray-50">Iptal</button>
-            <button onClick={handleSave} disabled={saving} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">{saving?'Ekleniyor...':'Ekle'}</button>
+            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 py-2.5 rounded-xl">Iptal</button>
+            <button onClick={handleSave} disabled={saving||!name.trim()} className="flex-1 bg-amber-500 text-white py-2.5 rounded-xl hover:bg-amber-600 font-medium disabled:opacity-50">{saving?'Ekleniyor...':'Ekle'}</button>
           </div>
         </div>
       </div>
     </div>
   );
 }
-// v5 - date modal, avatar component, photo fix
+// v6 - dates stored in localStorage, add team, photo fix
