@@ -138,3 +138,4 @@ export function subscribeToChanges(onTeams, onPlayers, onMatches) {
     .subscribe();
   return () => supabase.removeChannel(channel);
 }
+// v2 - Supabase realtime enabled
