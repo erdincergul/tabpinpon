@@ -1,15 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import {
-  isSupabaseConfigured, supabase,
-  dbGetTeams, dbGetPlayers, dbGetMatches,
-  dbUpsertTeam, dbDeleteTeam,
-  dbUpsertPlayer, dbDeletePlayer,
-  dbUpsertMatch, dbInsertMatches, dbDeleteAllMatches, dbResetMatchResults,
-  subscribeToChanges
-} from './supabase.js';
+import { isSupabaseConfigured, dbGetTeams, dbGetPlayers, dbGetMatches,
+  dbUpsertTeam, dbUpsertPlayer, dbDeletePlayer, dbInsertMatches, dbDeleteAllMatches,
+  dbResetMatchResults, dbUpsertMatch, subscribeToChanges } from './supabase.js';
 
-const ADMIN_PASSWORD = 'Admin2026Tab2026';
-const STORAGE_KEY = 'tabpinpon_data_v2';
+const STORAGE_KEY = 'tabpinpon_v3';
+const ADMIN_PW = 'Admin2026Tab2026';
+const RANKS = ['A', 'B', 'C', 'D'];
+const RANK_COLORS = { A: 'bg-red-100 text-red-700', B: 'bg-blue-100 text-blue-700', C: 'bg-green-100 text-green-700', D: 'bg-purple-100 text-purple-700' };
 
 const DEFAULT_TEAMS = [
   { id: 'fb', name: 'Fenerbahçe', color: '#003399', logo: '', players: [
@@ -30,7 +27,7 @@ const DEFAULT_TEAMS = [
     { id: 'gs6', name: 'Çağatay', photo: '', rank: 'C' },
     { id: 'gs7', name: 'Mehmet', photo: '', rank: 'C' },
   ]},
-  { id: 'bjk', name: 'Beşiktaş', color: '#1a1a1a', logo: '', players: [
+  { id: 'bjk', name: 'Beşiktaş', color: '#000000', logo: '', players: [
     { id: 'bjk1', name: 'Erhan', photo: '', rank: 'A' },
     { id: 'bjk2', name: 'Cemal', photo: '', rank: 'A' },
     { id: 'bjk3', name: 'Okan', photo: '', rank: 'B' },
@@ -44,33 +41,83 @@ const DEFAULT_TEAMS = [
 
 function genId() { return Math.random().toString(36).slice(2,9) + Date.now().toString(36); }
 
+// ── Generate Fixtures (shuffled/interleaved) ────────
 function generateFixtures(teams) {
-  const matches = [];
+  // First collect all match pairs by rank
+  const byRank = {};
   for (let i = 0; i < teams.length; i++) {
     for (let j = i + 1; j < teams.length; j++) {
       const tA = teams[i], tB = teams[j];
       for (const pA of tA.players) {
         for (const pB of tB.players) {
           if (pA.rank === pB.rank) {
-            matches.push({ id: genId(), teamAId: tA.id, teamBId: tB.id, playerAId: pA.id, playerBId: pB.id, sets: [], setA: 0, setB: 0, pointsA: 0, pointsB: 0, played: false });
+            const r = pA.rank;
+            if (!byRank[r]) byRank[r] = [];
+            byRank[r].push({ id: genId(), teamAId: tA.id, teamBId: tB.id,
+              playerAId: pA.id, playerBId: pB.id, sets: [], setA: 0, setB: 0,
+              pointsA: 0, pointsB: 0, played: false, matchDate: null });
           }
         }
       }
     }
   }
-  return matches;
+
+  // Shuffle each rank group and interleave so no player appears consecutively
+  const result = [];
+  for (const rank of RANKS) {
+    if (!byRank[rank]) continue;
+    const matches = byRank[rank];
+    // Fisher-Yates shuffle
+    for (let i = matches.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [matches[i], matches[j]] = [matches[j], matches[i]];
+    }
+    // Interleave: put matches into slots so no player plays two consecutive matches
+    const placed = [];
+    const remaining = [...matches];
+    let attempts = 0;
+    while (remaining.length > 0 && attempts < remaining.length * 10) {
+      const m = remaining[0];
+      const lastTwo = placed.slice(-2);
+      const playerBusy = lastTwo.some(pm =>
+        pm.playerAId === m.playerAId || pm.playerBId === m.playerAId ||
+        pm.playerAId === m.playerBId || pm.playerBId === m.playerBId
+      );
+      if (!playerBusy) {
+        placed.push(remaining.shift());
+        attempts = 0;
+      } else {
+        remaining.push(remaining.shift()); // rotate
+        attempts++;
+      }
+    }
+    // Add any remaining that couldn't be placed nicely
+    placed.push(...remaining);
+    result.push(...placed);
+  }
+  return result;
 }
 
 function loadLocal() {
-  try { const r = localStorage.getItem(STORAGE_KEY); if (r) return JSON.parse(r); } catch {}
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
   return { teams: DEFAULT_TEAMS, matches: [] };
 }
+
 function saveLocal(teams, matches) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ teams, matches })); } catch {}
 }
 
 function mapDbMatch(m) {
-  return { id: m.id, teamAId: m.team_a_id, teamBId: m.team_b_id, playerAId: m.player_a_id, playerBId: m.player_b_id, sets: m.sets || [], setA: m.sets_a || 0, setB: m.sets_b || 0, pointsA: m.points_a || 0, pointsB: m.points_b || 0, played: m.played || false };
+  return {
+    id: m.id, teamAId: m.team_a_id, teamBId: m.team_b_id,
+    playerAId: m.player_a_id, playerBId: m.player_b_id,
+    sets: m.sets || [], setA: m.sets_a || 0, setB: m.sets_b || 0,
+    pointsA: m.points_a || 0, pointsB: m.points_b || 0,
+    played: m.played || false, matchDate: m.match_date || null
+  };
 }
 
 function compressImage(file, maxW = 300) {
@@ -79,9 +126,10 @@ function compressImage(file, maxW = 300) {
     reader.onload = e => {
       const img = new Image();
       img.onload = () => {
-        const ratio = Math.min(maxW / img.width, 1);
+        const ratio = Math.min(1, maxW / img.width);
         const c = document.createElement('canvas');
-        c.width = img.width * ratio; c.height = img.height * ratio;
+        c.width = Math.round(img.width * ratio);
+        c.height = Math.round(img.height * ratio);
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
         res(c.toDataURL('image/jpeg', 0.7));
       };
@@ -91,25 +139,33 @@ function compressImage(file, maxW = 300) {
   });
 }
 
-const RANKS = ['A', 'B', 'C', 'D'];
-const RANK_COLORS = { A: 'bg-yellow-400 text-yellow-900', B: 'bg-gray-300 text-gray-800', C: 'bg-orange-300 text-orange-900', D: 'bg-blue-200 text-blue-900' };
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt)) return d;
+  return dt.toLocaleDateString('tr-TR', { day:'2-digit', month:'2-digit', year:'numeric' });
+}
 
 export default function App() {
   const [teams, setTeams] = useState([]);
   const [matches, setMatches] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [online, setOnline] = useState(isSupabaseConfigured);
   const [tab, setTab] = useState('standings');
   const [isAdmin, setIsAdmin] = useState(false);
-  const [pwInput, setPwInput] = useState('');
+  const [pw, setPw] = useState('');
   const [pwError, setPwError] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [online, setOnline] = useState(false);
+  const [flash, setFlashMsg] = useState('');
   const [editMatch, setEditMatch] = useState(null);
   const [editPlayer, setEditPlayer] = useState(null);
   const [editTeam, setEditTeam] = useState(null);
-  const [showAddPlayer, setShowAddPlayer] = useState(null);
+  const [addPlayerTeamId, setAddPlayerTeamId] = useState(null);
+  const [removeMode, setRemoveMode] = useState(null);
   const [filterRank, setFilterRank] = useState('all');
   const [filterTeam, setFilterTeam] = useState('all');
-  const [msg, setMsg] = useState('');
+  const [filterDate, setFilterDate] = useState('');
+
+  function flash(msg) { setFlashMsg(msg); setTimeout(() => setFlashMsg(''), 3000); }
 
   // ── Load data ──────────────────────────────────────
   const loadFromSupabase = useCallback(async () => {
@@ -131,6 +187,7 @@ export default function App() {
   useEffect(() => {
     async function init() {
       if (isSupabaseConfigured) {
+        setOnline(true);
         const ok = await loadFromSupabase();
         if (!ok) {
           const local = loadLocal();
@@ -164,94 +221,49 @@ export default function App() {
     if (!isSupabaseConfigured && teams.length > 0) saveLocal(teams, matches);
   }, [teams, matches]);
 
-  function flash(m) { setMsg(m); setTimeout(() => setMsg(''), 3500); }
+  // ── Auth ───────────────────────────────────────────
   function login() {
-    if (pwInput === ADMIN_PASSWORD) { setIsAdmin(true); setPwError(false); setPwInput(''); }
+    if (pw === ADMIN_PW) { setIsAdmin(true); setPwError(false); setPw(''); }
     else { setPwError(true); }
   }
 
   // ── Standings ──────────────────────────────────────
   function calcStandings() {
     return teams.map(t => {
-      const tm = matches.filter(m => m.played && (m.teamAId === t.id || m.teamBId === t.id));
       let W=0,L=0,SA=0,SB=0,PA=0,PB=0;
+      const tm = matches.filter(m => m.played && (m.teamAId===t.id||m.teamBId===t.id));
       tm.forEach(m => {
-        const a = m.teamAId === t.id;
-        const ws = a?m.setA:m.setB, ls = a?m.setB:m.setA;
-        const pa = a?m.pointsA:m.pointsB, pb = a?m.pointsB:m.pointsA;
+        const isA=m.teamAId===t.id;
+        const ws=isA?m.setA:m.setB, ls=isA?m.setB:m.setA;
+        SA+=ws; SB+=ls;
+        const wp=isA?m.pointsA:m.pointsB, lp=isA?m.pointsB:m.pointsA;
+        PA+=wp; PB+=lp;
         if(ws>ls) W++; else L++;
-        SA+=ws; SB+=ls; PA+=pa; PB+=pb;
       });
       return { ...t, played:tm.length, W, L, SA, SB, PA, PB, pts:W*3 };
-    }).sort((a,b) => b.pts-a.pts || (b.SA-b.SB)-(a.SA-a.SB));
+    }).sort((a,b)=>b.pts-a.pts||(b.SA-b.SB)-(a.SA-a.SB)||(b.PA-b.PB)-(a.PA-a.PB));
   }
 
   function calcPlayerStats() {
     return teams.flatMap(t => t.players.map(p => {
-      const pm = matches.filter(m => m.played && (m.playerAId===p.id || m.playerBId===p.id));
       let W=0,L=0,SA=0,SB=0,PA=0,PB=0;
+      const pm = matches.filter(m => m.played && (m.playerAId===p.id||m.playerBId===p.id));
       pm.forEach(m => {
-        const a = m.playerAId===p.id;
-        const ws=a?m.setA:m.setB, ls=a?m.setB:m.setA;
-        const pa=a?m.pointsA:m.pointsB, pb=a?m.pointsB:m.pointsA;
+        const isA=m.playerAId===p.id;
+        const ws=isA?m.setA:m.setB, ls=isA?m.setB:m.setA;
+        SA+=ws; SB+=ls;
+        const wp=isA?m.pointsA:m.pointsB, lp=isA?m.pointsB:m.pointsA;
+        PA+=wp; PB+=lp;
         if(ws>ls) W++; else L++;
-        SA+=ws; SB+=ls; PA+=pa; PB+=pb;
       });
       return { ...p, teamId:t.id, teamName:t.name, teamColor:t.color, played:pm.length, W, L, SA, SB, PA, PB, pts:W*3 };
-    })).sort((a,b) => b.pts-a.pts || (b.SA-b.SB)-(a.SA-a.SB));
-  }
-  // ── Team actions ───────────────────────────────────
-  async function handleSaveTeam(updated) {
-    if (isSupabaseConfigured) {
-      try { await dbUpsertTeam(updated); } catch(e) { flash('Hata: ' + e.message); return; }
-      await loadFromSupabase();
-    } else {
-      setTeams(ts => ts.map(t => t.id===updated.id ? updated : t));
-    }
-    setEditTeam(null); flash('Takım güncellendi.');
-  }
-
-  // ── Player actions ─────────────────────────────────
-  async function handleSavePlayer(updated) {
-    if (isSupabaseConfigured) {
-      try { await dbUpsertPlayer({ ...updated, teamId: updated.teamId || teams.find(t=>t.players.some(p=>p.id===updated.id))?.id }); } catch(e) { flash('Hata: ' + e.message); return; }
-      await loadFromSupabase();
-    } else {
-      setTeams(ts => ts.map(t => ({ ...t, players: t.players.map(p => p.id===updated.id ? updated : p) })));
-    }
-    setEditPlayer(null); flash('Oyuncu güncellendi.');
-  }
-
-  async function handleAddPlayer(teamId, player) {
-    const newPlayer = { ...player, id: genId() };
-    if (isSupabaseConfigured) {
-      const team = teams.find(t=>t.id===teamId);
-      const order = team ? team.players.length : 0;
-      try { await dbUpsertPlayer({ ...newPlayer, teamId, displayOrder: order }); } catch(e) { flash('Hata: ' + e.message); return; }
-      await loadFromSupabase();
-    } else {
-      setTeams(ts => ts.map(t => t.id===teamId ? { ...t, players:[...t.players, newPlayer] } : t));
-    }
-    setShowAddPlayer(null); flash('Oyuncu eklendi.');
-  }
-
-  async function handleRemovePlayer(teamId, playerId) {
-    if (!confirm('Bu oyuncuyu silmek istiyor musunuz?')) return;
-    if (isSupabaseConfigured) {
-      try { await dbDeletePlayer(playerId); } catch(e) { flash('Hata: ' + e.message); return; }
-      await loadFromSupabase();
-    } else {
-      setTeams(ts => ts.map(t => t.id===teamId ? { ...t, players:t.players.filter(p=>p.id!==playerId) } : t));
-      setMatches(ms => ms.filter(m => m.playerAId!==playerId && m.playerBId!==playerId));
-    }
-    flash('Oyuncu silindi.');
+    })).sort((a,b)=>b.pts-a.pts);
   }
 
   // ── Fixture actions ────────────────────────────────
   async function handleGenerateFixtures() {
     if (!confirm('Mevcut fikstür silinip yeniden oluşturulacak. Onaylıyor musunuz?')) return;
     const newMatches = generateFixtures(teams);
-    if (newMatches.length === 0) { flash('Fikstür oluşturulamadı. Oyunculara klasman atandığından emin olun.'); return; }
     if (isSupabaseConfigured) {
       try {
         await dbDeleteAllMatches();
@@ -270,24 +282,84 @@ export default function App() {
       try { await dbResetMatchResults(); } catch(e) { flash('Hata: ' + e.message); return; }
       await loadFromSupabase();
     } else {
-      setMatches(ms => ms.map(m => ({ ...m, sets:[], setA:0, setB:0, pointsA:0, pointsB:0, played:false })));
+      setMatches(prev => prev.map(m => ({...m, sets:[], setA:0, setB:0, pointsA:0, pointsB:0, played:false})));
     }
     flash('Tüm sonuçlar sıfırlandı.');
   }
 
   // ── Match save ─────────────────────────────────────
-  async function handleSaveMatch(matchId, sets) {
-    let setA=0, setB=0, pointsA=0, pointsB=0;
-    sets.forEach(s => { if(s.a>s.b) setA++; else if(s.b>s.a) setB++; pointsA+=s.a; pointsB+=s.b; });
-    const updated = { id:matchId, ...matches.find(m=>m.id===matchId), sets, setA, setB, pointsA, pointsB, played:sets.length>0 };
+  async function handleSaveMatch(matchId, sets, matchDate) {
+    const sA = sets.filter(s=>s.a>s.b).length, sB = sets.filter(s=>s.b>s.a).length;
+    const pA = sets.reduce((s,x)=>s+(+x.a||0),0), pB = sets.reduce((s,x)=>s+(+x.b||0),0);
+    const updated = { ...matches.find(m=>m.id===matchId), sets, setA:sA, setB:sB, pointsA:pA, pointsB:pB, played:true, matchDate:matchDate||null };
     if (isSupabaseConfigured) {
       try { await dbUpsertMatch(updated); } catch(e) { flash('Hata: ' + e.message); return; }
-      // Realtime will update state automatically, but also update locally for instant feedback
-      setMatches(ms => ms.map(m => m.id===matchId ? updated : m));
+      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
     } else {
-      setMatches(ms => ms.map(m => m.id===matchId ? updated : m));
+      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
     }
     setEditMatch(null); flash('Maç kaydedildi! ✓');
+  }
+
+  // ── Date save (without result) ─────────────────────
+  async function handleSaveDate(matchId, matchDate) {
+    const updated = { ...matches.find(m=>m.id===matchId), matchDate: matchDate||null };
+    if (isSupabaseConfigured) {
+      try { await dbUpsertMatch(updated); } catch(e) { flash('Hata: ' + e.message); return; }
+      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
+    } else {
+      setMatches(prev => prev.map(m => m.id===matchId ? updated : m));
+    }
+    flash('Tarih kaydedildi! ✓');
+  }
+
+  // ── Player actions ─────────────────────────────────
+  async function handleSavePlayer(player) {
+    const updTeams = teams.map(t => ({
+      ...t,
+      players: t.players.map(p => p.id===player.id ? {...p,...player} : p)
+    }));
+    if (isSupabaseConfigured) {
+      const t = updTeams.find(t => t.players.some(p=>p.id===player.id));
+      try { await dbUpsertPlayer({...player, teamId:t?.id}); } catch(e) { flash('Hata: ' + e.message); return; }
+      await loadFromSupabase();
+    } else {
+      setTeams(updTeams);
+    }
+    setEditPlayer(null); flash('Oyuncu güncellendi! ✓');
+  }
+
+  async function handleAddPlayer(teamId, playerData) {
+    const newP = { id: genId(), name: playerData.name, rank: playerData.rank||'B', photo: playerData.photo||'' };
+    if (isSupabaseConfigured) {
+      try { await dbUpsertPlayer({...newP, teamId}); } catch(e) { flash('Hata: ' + e.message); return; }
+      await loadFromSupabase();
+    } else {
+      setTeams(prev => prev.map(t => t.id===teamId ? {...t, players:[...t.players,newP]} : t));
+    }
+    setAddPlayerTeamId(null); flash('Oyuncu eklendi! ✓');
+  }
+
+  async function handleRemovePlayer(playerId) {
+    if (!confirm('Bu oyuncu kadrodan çıkarılacak. Onaylıyor musunuz?')) return;
+    if (isSupabaseConfigured) {
+      try { await dbDeletePlayer(playerId); } catch(e) { flash('Hata: ' + e.message); return; }
+      await loadFromSupabase();
+    } else {
+      setTeams(prev => prev.map(t => ({...t, players:t.players.filter(p=>p.id!==playerId)})));
+    }
+    flash('Oyuncu çıkarıldı! ✓');
+  }
+
+  // ── Team actions ───────────────────────────────────
+  async function handleSaveTeam(team) {
+    if (isSupabaseConfigured) {
+      try { await dbUpsertTeam(team); } catch(e) { flash('Hata: ' + e.message); return; }
+      await loadFromSupabase();
+    } else {
+      setTeams(prev => prev.map(t => t.id===team.id ? {...t,...team} : t));
+    }
+    setEditTeam(null); flash('Takım güncellendi! ✓');
   }
 
   const standings = calcStandings();
@@ -321,8 +393,8 @@ export default function App() {
               <span onClick={() => setIsAdmin(false)} className="text-xs bg-green-100 text-green-700 px-3 py-1 rounded-full font-medium cursor-pointer hover:bg-green-200">✓ Admin</span>
             ) : (
               <div className="flex gap-1">
-                <input type="password" value={pwInput} onChange={e=>setPwInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&login()}
-                  placeholder="Şifre" className={`border rounded px-2 py-1 text-sm w-28 ${pwError?'border-red-400':'border-gray-300'}`} />
+                <input value={pw} onChange={e=>{setPw(e.target.value);setPwError(false);}} onKeyDown={e=>e.key==='Enter'&&login()} type="password"
+                  placeholder="Şifre" className={"border rounded px-2 py-1 text-sm w-28 " + (pwError?'border-red-400':'border-gray-300')} />
                 <button onClick={login} className="bg-amber-500 text-white px-3 py-1 rounded text-sm hover:bg-amber-600">Giriş</button>
               </div>
             )}
@@ -330,31 +402,32 @@ export default function App() {
         </div>
       </header>
 
-      {msg && <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-green-500 text-white px-6 py-2 rounded-full shadow-lg text-sm font-medium animate-bounce">{msg}</div>}
+      {flash && <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-green-600 text-white px-4 py-2 rounded-full shadow-lg text-sm font-medium">{flash}</div>}
 
       <div className="max-w-5xl mx-auto px-4 pt-4">
         <div className="flex gap-1 border-b border-amber-200 overflow-x-auto">
           {[['standings','🏆 Puan Durumu'],['matches','⚔️ Maçlar'],['players','👤 Oyuncular'],['squads','👥 Kadrolar']].map(([k,v]) => (
             <button key={k} onClick={()=>setTab(k)}
-              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${tab===k?'border-amber-500 text-amber-600':'border-transparent text-gray-500 hover:text-gray-700'}`}>{v}</button>
+              className={"px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap " + (tab===k?'border-amber-500 text-amber-600':'border-transparent text-gray-500 hover:text-gray-700')}>{v}</button>
           ))}
         </div>
       </div>
 
       <main className="max-w-5xl mx-auto px-4 py-6">
-        {tab==='standings' && <StandingsTab standings={standings} teams={teams} matches={matches} isAdmin={isAdmin} onGenerate={handleGenerateFixtures} onReset={handleResetAll} />}
-        {tab==='matches' && <MatchesTab teams={teams} matches={matches} isAdmin={isAdmin} onEdit={setEditMatch} filterRank={filterRank} setFilterRank={setFilterRank} filterTeam={filterTeam} setFilterTeam={setFilterTeam} />}
-        {tab==='players' && <PlayersTab playerStats={playerStats} teams={teams} isAdmin={isAdmin} onEdit={setEditPlayer} />}
-        {tab==='squads' && <SquadsTab teams={teams} isAdmin={isAdmin} onEditTeam={setEditTeam} onEditPlayer={setEditPlayer} onAddPlayer={setShowAddPlayer} onRemovePlayer={handleRemovePlayer} />}
+        {tab==='standings' && <StandingsTab standings={standings} teams={teams} matches={matches} isAdmin={isAdmin} onGenerate={handleGenerateFixtures} onReset={handleResetAll}/>}
+        {tab==='matches' && <MatchesTab teams={teams} matches={matches} isAdmin={isAdmin} onEdit={setEditMatch} onSaveDate={handleSaveDate} filterRank={filterRank} setFilterRank={setFilterRank} filterTeam={filterTeam} setFilterTeam={setFilterTeam} filterDate={filterDate} setFilterDate={setFilterDate}/>}
+        {tab==='players' && <PlayersTab playerStats={playerStats} teams={teams} isAdmin={isAdmin} onEdit={setEditPlayer}/>}
+        {tab==='squads' && <SquadsTab teams={teams} isAdmin={isAdmin} onEditTeam={setEditTeam} onEditPlayer={setEditPlayer} onAddPlayer={setAddPlayerTeamId} onRemovePlayer={handleRemovePlayer}/>}
       </main>
 
-      {editMatch && <MatchModal match={editMatch} teams={teams} onSave={handleSaveMatch} onClose={()=>setEditMatch(null)} />}
-      {editPlayer && <PlayerModal player={editPlayer} teams={teams} onSave={handleSavePlayer} onClose={()=>setEditPlayer(null)} />}
-      {editTeam && <TeamModal team={editTeam} onSave={handleSaveTeam} onClose={()=>setEditTeam(null)} />}
-      {showAddPlayer && <AddPlayerModal teamId={showAddPlayer} onSave={handleAddPlayer} onClose={()=>setShowAddPlayer(null)} />}
+      {editMatch && <MatchModal match={editMatch} teams={teams} onSave={handleSaveMatch} onClose={()=>setEditMatch(null)}/>}
+      {editPlayer && <PlayerModal player={editPlayer} teams={teams} onSave={handleSavePlayer} onClose={()=>setEditPlayer(null)}/>}
+      {editTeam && <TeamModal team={editTeam} onSave={handleSaveTeam} onClose={()=>setEditTeam(null)}/>}
+      {addPlayerTeamId && <AddPlayerModal teamId={addPlayerTeamId} onSave={handleAddPlayer} onClose={()=>setAddPlayerTeamId(null)}/>}
     </div>
   );
 }
+
 // ── StandingsTab ───────────────────────────────────
 function StandingsTab({ standings, teams, matches, isAdmin, onGenerate, onReset }) {
   const played = matches.filter(m=>m.played).length;
@@ -404,21 +477,38 @@ function StandingsTab({ standings, teams, matches, isAdmin, onGenerate, onReset 
 }
 
 // ── MatchesTab ─────────────────────────────────────
-function MatchesTab({ teams, matches, isAdmin, onEdit, filterRank, setFilterRank, filterTeam, setFilterTeam }) {
-  const getTeam = id => teams.find(t=>t.id===id)||{name:'?',color:'#999'};
-  const getPlayer = (tid,pid) => (teams.find(t=>t.id===tid)?.players||[]).find(p=>p.id===pid)||{name:'?'};
+function MatchesTab({ teams, matches, isAdmin, onEdit, onSaveDate, filterRank, setFilterRank, filterTeam, setFilterTeam, filterDate, setFilterDate }) {
+  // Sort by date first (null dates at end), then by rank
+  const sorted = [...matches].sort((a,b) => {
+    if (a.matchDate && b.matchDate) return new Date(a.matchDate) - new Date(b.matchDate);
+    if (a.matchDate) return -1;
+    if (b.matchDate) return 1;
+    return 0;
+  });
 
-  const filtered = matches.filter(m => {
-    const pA = getPlayer(m.teamAId, m.playerAId);
-    if (filterRank!=='all' && pA.rank!==filterRank) return false;
-    if (filterTeam!=='all' && m.teamAId!==filterTeam && m.teamBId!==filterTeam) return false;
+  const filtered = sorted.filter(m => {
+    if (filterRank !== 'all') {
+      const pA = teams.flatMap(t=>t.players).find(p=>p.id===m.playerAId);
+      if (!pA || pA.rank !== filterRank) return false;
+    }
+    if (filterTeam !== 'all' && m.teamAId !== filterTeam && m.teamBId !== filterTeam) return false;
+    if (filterDate && m.matchDate !== filterDate) return false;
     return true;
   });
 
-  const groups = {};
+  // Group by date (null = "Tarihsiz")
+  const byDate = {};
   filtered.forEach(m => {
-    const r = getPlayer(m.teamAId,m.playerAId).rank||'?';
-    (groups[r] = groups[r]||[]).push(m);
+    const key = m.matchDate || '__nodate__';
+    if (!byDate[key]) byDate[key] = [];
+    byDate[key].push(m);
+  });
+
+  // Sort date keys
+  const dateKeys = Object.keys(byDate).sort((a,b) => {
+    if (a === '__nodate__') return 1;
+    if (b === '__nodate__') return -1;
+    return new Date(a) - new Date(b);
   });
 
   return (
@@ -433,37 +523,48 @@ function MatchesTab({ teams, matches, isAdmin, onEdit, filterRank, setFilterRank
           <option value="all">Tüm Takımlar</option>
           {teams.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
         </select>
+        <input type="date" value={filterDate} onChange={e=>setFilterDate(e.target.value)}
+          className="border border-gray-200 rounded px-3 py-1.5 text-sm bg-white"
+          title="Tarihe göre filtrele"/>
+        {filterDate && <button onClick={()=>setFilterDate('')} className="text-xs text-gray-400 hover:text-gray-600">✕ Tarih sil</button>}
         <span className="text-sm text-gray-400">{filtered.filter(m=>m.played).length}/{filtered.length} oynandı</span>
       </div>
-      {Object.keys(groups).sort().map(rank => (
-        <div key={rank} className="mb-8">
+
+      {dateKeys.map(dateKey => (
+        <div key={dateKey} className="mb-8">
           <div className="flex items-center gap-2 mb-3">
-            <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${RANK_COLORS[rank]||'bg-gray-200'}`}>Klasman {rank}</span>
-            <span className="text-xs text-gray-400">{groups[rank].filter(m=>m.played).length}/{groups[rank].length}</span>
+            <span className="text-sm font-bold text-gray-600 bg-white border border-gray-200 px-3 py-1 rounded-full shadow-sm">
+              {dateKey === '__nodate__' ? '📅 Tarih Belirlenmemiş' : ('📅 ' + fmtDate(dateKey))}
+            </span>
+            <span className="text-xs text-gray-400">{byDate[dateKey].filter(m=>m.played).length}/{byDate[dateKey].length}</span>
           </div>
           <div className="space-y-2">
-            {groups[rank].map(m => {
-              const tA=getTeam(m.teamAId), tB=getTeam(m.teamBId);
-              const pA=getPlayer(m.teamAId,m.playerAId), pB=getPlayer(m.teamBId,m.playerBId);
+            {byDate[dateKey].map(m => {
+              const tA=teams.find(t=>t.id===m.teamAId)||{}, tB=teams.find(t=>t.id===m.teamBId)||{};
+              const pA=tA.players?.find(p=>p.id===m.playerAId)||{}, pB=tB.players?.find(p=>p.id===m.playerBId)||{};
+              const rank = pA.rank || pB.rank;
               return (
                 <div key={m.id} onClick={()=>isAdmin&&onEdit(m)}
-                  className={`bg-white rounded-lg border px-4 py-3 flex items-center gap-2 ${isAdmin?'cursor-pointer hover:border-amber-300 active:bg-amber-50':''} ${m.played?'border-green-200 bg-green-50/30':'border-gray-100'}`}>
-                  <div className="flex-1 text-right">
-                    <div className="flex items-center justify-end gap-2">
-                      {pA.photo?<img src={pA.photo} className="w-8 h-8 rounded-full object-cover"/>:<div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold shrink-0" style={{background:tA.color||'#999'}}>{(pA.name||'?')[0]}</div>}
-                      <div><div className="font-medium text-gray-800 text-sm">{pA.name}</div><div className="text-xs text-gray-400">{tA.name}</div></div>
+                  className={"bg-white rounded-lg border px-4 py-3 " + (isAdmin?'cursor-pointer hover:border-amber-300 active:bg-amber-50 ':' ') + (m.played?'border-green-200 bg-green-50/30':'border-gray-100')}>
+                  <div className="flex items-center gap-2">
+                    {rank && <span className={"text-xs font-bold px-1.5 py-0.5 rounded-full shrink-0 " + (RANK_COLORS[rank]||'bg-gray-200')}>{rank}</span>}
+                    <div className="flex-1 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        {pA.photo?<img src={pA.photo} className="w-8 h-8 rounded-full object-cover"/>:<div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold shrink-0" style={{background:tA.color||'#999'}}>{(pA.name||'?')[0]}</div>}
+                        <div><div className="font-medium text-gray-800 text-sm">{pA.name}</div><div className="text-xs text-gray-400">{tA.name}</div></div>
+                      </div>
                     </div>
-                  </div>
-                  <div className="text-center min-w-[60px]">
-                    {m.played ? <div>
-                      <div className="font-bold text-gray-800 text-base">{m.setA}<span className="text-gray-300 mx-1">-</span>{m.setB}</div>
-                      <div className="text-xs text-gray-400">{m.pointsA}-{m.pointsB}</div>
-                    </div> : <div className="text-xs text-gray-300 font-medium">vs</div>}
-                  </div>
-                  <div className="flex-1 text-left">
-                    <div className="flex items-center gap-2">
-                      {pB.photo?<img src={pB.photo} className="w-8 h-8 rounded-full object-cover"/>:<div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold shrink-0" style={{background:tB.color||'#999'}}>{(pB.name||'?')[0]}</div>}
-                      <div><div className="font-medium text-gray-800 text-sm">{pB.name}</div><div className="text-xs text-gray-400">{tB.name}</div></div>
+                    <div className="text-center min-w-[60px]">
+                      {m.played ? <div>
+                        <div className="font-bold text-gray-800 text-base">{m.setA}<span className="text-gray-300 mx-1">-</span>{m.setB}</div>
+                        <div className="text-xs text-gray-400">{m.pointsA}-{m.pointsB}</div>
+                      </div> : <div className="text-xs text-gray-300 font-medium">vs</div>}
+                    </div>
+                    <div className="flex-1 text-left">
+                      <div className="flex items-center gap-2">
+                        {pB.photo?<img src={pB.photo} className="w-8 h-8 rounded-full object-cover"/>:<div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold shrink-0" style={{background:tB.color||'#999'}}>{(pB.name||'?')[0]}</div>}
+                        <div><div className="font-medium text-gray-800 text-sm">{pB.name}</div><div className="text-xs text-gray-400">{tB.name}</div></div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -472,33 +573,32 @@ function MatchesTab({ teams, matches, isAdmin, onEdit, filterRank, setFilterRank
           </div>
         </div>
       ))}
-      {filtered.length===0 && <div className="text-center text-gray-400 py-16"><div className="text-5xl mb-3">🏓</div><div>Fikstür bulunamadı.<br/>Admin olarak giriş yapıp "Fikstür Oluştur" butonuna tıklayın.</div></div>}
+
+      {filtered.length === 0 && (
+        <div className="text-center py-16 text-gray-300">
+          <div className="text-5xl mb-3">🏓</div>
+          <div>Maç bulunamadı</div>
+        </div>
+      )}
     </div>
   );
 }
+
 // ── PlayersTab ─────────────────────────────────────
 function PlayersTab({ playerStats, teams, isAdmin, onEdit }) {
   const [rankFilter, setRankFilter] = useState('all');
   const [teamFilter, setTeamFilter] = useState('all');
-  const filtered = playerStats.filter(p => (rankFilter==='all'||p.rank===rankFilter) && (teamFilter==='all'||p.teamId===teamFilter));
-  const top3 = [...filtered].sort((a,b)=>b.pts-a.pts).slice(0,3);
+  const filtered = playerStats.filter(p => {
+    if (rankFilter !== 'all' && p.rank !== rankFilter) return false;
+    if (teamFilter !== 'all' && p.teamId !== teamFilter) return false;
+    return true;
+  });
   return (
     <div>
-      <h2 className="text-xl font-bold text-gray-800 mb-4">Oyuncu İstatistikleri</h2>
-      {top3.length>=3 && (
-        <div className="grid grid-cols-3 gap-3 mb-6">
-          {top3.map((p,i) => (
-            <div key={p.id} onClick={()=>isAdmin&&onEdit(p)} className={`bg-white rounded-xl border border-amber-100 p-4 text-center shadow-sm ${isAdmin?'cursor-pointer hover:border-amber-300':''}`}>
-              <div className="text-2xl mb-1">{['🥇','🥈','🥉'][i]}</div>
-              {p.photo?<img src={p.photo} className="w-14 h-14 rounded-full object-cover mx-auto mb-2"/>:<div className="w-14 h-14 rounded-full flex items-center justify-center text-white text-xl font-bold mx-auto mb-2" style={{background:p.teamColor}}>{p.name[0]}</div>}
-              <div className="font-semibold text-gray-800 text-sm">{p.name}</div>
-              <div className="text-xs text-gray-400 mb-1">{p.teamName}</div>
-              <span className={`text-xs px-1.5 py-0.5 rounded-full font-bold ${RANK_COLORS[p.rank]||'bg-gray-200'}`}>{p.rank}</span>
-              <div className="text-amber-600 font-bold text-lg mt-1">{p.pts}P</div>
-            </div>
-          ))}
-        </div>
-      )}
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 className="text-xl font-bold text-gray-800">Oyuncu İstatistikleri</h2>
+        {isAdmin && <button className="text-xs text-amber-600 hover:text-amber-800 font-medium">✏️ Oyuncu Düzenle</button>}
+      </div>
       <div className="flex gap-3 mb-4 flex-wrap">
         <select value={rankFilter} onChange={e=>setRankFilter(e.target.value)} className="border border-gray-200 rounded px-3 py-1.5 text-sm bg-white">
           <option value="all">Tüm Klasmanlar</option>
@@ -522,13 +622,13 @@ function PlayersTab({ playerStats, teams, isAdmin, onEdit }) {
           </tr></thead>
           <tbody>
             {filtered.map((p,i) => (
-              <tr key={p.id} onClick={()=>isAdmin&&onEdit(p)} className={`border-t border-gray-100 hover:bg-amber-50/50 ${isAdmin?'cursor-pointer':''}`}>
+              <tr key={p.id} onClick={()=>isAdmin&&onEdit(p)} className={"border-t border-gray-100 " + (isAdmin?'cursor-pointer hover:bg-amber-50/50':'')}>
                 <td className="px-4 py-2.5 text-gray-400 font-bold">{i+1}</td>
                 <td className="px-4 py-2.5"><div className="flex items-center gap-2">
                   {p.photo?<img src={p.photo} className="w-8 h-8 rounded-full object-cover"/>:<div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-bold shrink-0" style={{background:p.teamColor}}>{p.name[0]}</div>}
                   <div><div className="font-medium text-gray-800">{p.name}</div><div className="text-xs text-gray-400">{p.teamName}</div></div>
                 </div></td>
-                <td className="text-center px-2 py-2.5"><span className={`text-xs px-1.5 py-0.5 rounded-full font-bold ${RANK_COLORS[p.rank]||'bg-gray-200'}`}>{p.rank||'-'}</span></td>
+                <td className="text-center px-2 py-2.5"><span className={"text-xs px-1.5 py-0.5 rounded-full font-bold " + (RANK_COLORS[p.rank]||'bg-gray-200')}>{p.rank||'-'}</span></td>
                 <td className="text-center px-2 py-2.5 text-gray-600">{p.played}</td>
                 <td className="text-center px-2 py-2.5 text-green-600 font-semibold">{p.W}</td>
                 <td className="text-center px-2 py-2.5 text-red-500 font-semibold">{p.L}</td>
@@ -564,12 +664,12 @@ function SquadsTab({ teams, isAdmin, onEditTeam, onEditPlayer, onAddPlayer, onRe
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
                 {t.players.map(p => (
                   <div key={p.id} className="relative group">
-                    <div onClick={()=>isAdmin&&onEditPlayer({...p,teamId:t.id})} className={`bg-amber-50 rounded-lg p-3 text-center border border-amber-100 ${isAdmin?'cursor-pointer hover:border-amber-300':''}`}>
+                    <div onClick={()=>isAdmin&&onEditPlayer({...p,teamId:t.id})} className={"text-center p-3 rounded-xl border border-gray-100 hover:border-amber-200 transition-colors " + (isAdmin?'cursor-pointer':'')}>
                       {p.photo?<img src={p.photo} className="w-14 h-14 rounded-full object-cover mx-auto mb-2"/>:<div className="w-14 h-14 rounded-full flex items-center justify-center text-white text-xl font-bold mx-auto mb-2 shrink-0" style={{background:t.color}}>{p.name[0]}</div>}
                       <div className="font-medium text-gray-800 text-sm">{p.name}</div>
-                      <div className="mt-1"><span className={`text-xs px-1.5 py-0.5 rounded-full font-bold ${RANK_COLORS[p.rank]||'bg-gray-200'}`}>{p.rank||'-'}</span></div>
+                      <div className="mt-1"><span className={"text-xs px-1.5 py-0.5 rounded-full font-bold " + (RANK_COLORS[p.rank]||'bg-gray-200')}>{p.rank||'-'}</span></div>
                     </div>
-                    {isAdmin && <button onClick={e=>{e.stopPropagation();onRemovePlayer(t.id,p.id)}} className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white rounded-full text-xs hidden group-hover:flex items-center justify-center hover:bg-red-600 font-bold">×</button>}
+                    {isAdmin && <button onClick={e=>{e.stopPropagation();onRemovePlayer(p.id);}} className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow">×</button>}
                   </div>
                 ))}
               </div>
@@ -580,48 +680,54 @@ function SquadsTab({ teams, isAdmin, onEditTeam, onEditPlayer, onAddPlayer, onRe
     </div>
   );
 }
+
 // ── MatchModal ─────────────────────────────────────
 function MatchModal({ match, teams, onSave, onClose }) {
-  const getTeam = id => teams.find(t=>t.id===id)||{name:'?',color:'#999'};
-  const getPlayer = (tid,pid) => (teams.find(t=>t.id===tid)?.players||[]).find(p=>p.id===pid)||{name:'?'};
-  const tA=getTeam(match.teamAId), tB=getTeam(match.teamBId);
-  const pA=getPlayer(match.teamAId,match.playerAId), pB=getPlayer(match.teamBId,match.playerBId);
-  const [sets, setSets] = useState(match.sets?.length ? match.sets.map(s=>({a:String(s.a),b:String(s.b)})) : [{a:'',b:''},{a:'',b:''},{a:'',b:''}]);
+  const tA=teams.find(t=>t.id===match.teamAId)||{}, tB=teams.find(t=>t.id===match.teamBId)||{};
+  const pA=tA.players?.find(p=>p.id===match.playerAId)||{}, pB=tB.players?.find(p=>p.id===match.playerBId)||{};
+  const [sets, setSets] = useState(match.sets?.length>0?match.sets:[{a:'',b:''},{a:'',b:''},{a:'',b:''}]);
+  const [matchDate, setMatchDate] = useState(match.matchDate||'');
   const [saving, setSaving] = useState(false);
 
-  function setVal(i,side,v) { setSets(s=>s.map((x,j)=>j===i?{...x,[side]:v}:x)); }
-  function addSet() { setSets(s=>[...s,{a:'',b:''}]); }
-  function removeSet(i) { setSets(s=>s.filter((_,j)=>j!==i)); }
+  const setA = sets.filter(s=>+s.a>+s.b).length;
+  const setB = sets.filter(s=>+s.b>+s.a).length;
 
-  let setA=0,setB=0;
-  sets.forEach(s=>{const a=parseInt(s.a)||0,b=parseInt(s.b)||0;if(a>b)setA++;else if(b>a)setB++;});
+  function setVal(i,side,v) { setSets(prev=>prev.map((s,idx)=>idx===i?{...s,[side]:v}:s)); }
+  function addSet() { setSets(prev=>[...prev,{a:'',b:''}]); }
+  function removeSet(i) { if(sets.length>2) setSets(prev=>prev.filter((_,idx)=>idx!==i)); }
 
   async function handleSave() {
+    const filled = sets.filter(s=>s.a!==''&&s.b!=='');
+    if (filled.length < 2) { alert('En az 2 set giriniz.'); return; }
     setSaving(true);
-    const filled = sets.filter(s=>s.a!==''&&s.b!=='').map(s=>({a:parseInt(s.a)||0,b:parseInt(s.b)||0}));
-    await onSave(match.id, filled);
+    await onSave(match.id, filled, matchDate);
     setSaving(false);
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md" onClick={e=>e.stopPropagation()}>
         <div className="p-6">
           <h3 className="text-lg font-bold text-gray-800 mb-4">Maç Sonucu Gir</h3>
-          <div className="flex items-center justify-between mb-5">
+          <div className="flex items-center justify-between mb-4">
             <div className="text-center flex-1">
               {pA.photo?<img src={pA.photo} className="w-12 h-12 rounded-full object-cover mx-auto mb-1"/>:<div className="w-12 h-12 rounded-full flex items-center justify-center text-white font-bold mx-auto mb-1" style={{background:tA.color}}>{(pA.name||'?')[0]}</div>}
               <div className="font-semibold text-sm">{pA.name}</div>
               <div className="text-xs text-gray-400">{tA.name}</div>
-              <div className={`text-3xl font-bold mt-1 ${setA>setB?'text-green-500':setA<setB?'text-red-400':'text-gray-400'}`}>{setA}</div>
+              <div className={"text-3xl font-bold mt-1 " + (setA>setB?'text-green-500':setA<setB?'text-red-400':'text-gray-400')}>{setA}</div>
             </div>
             <div className="text-gray-200 text-2xl mx-2">vs</div>
             <div className="text-center flex-1">
               {pB.photo?<img src={pB.photo} className="w-12 h-12 rounded-full object-cover mx-auto mb-1"/>:<div className="w-12 h-12 rounded-full flex items-center justify-center text-white font-bold mx-auto mb-1" style={{background:tB.color}}>{(pB.name||'?')[0]}</div>}
               <div className="font-semibold text-sm">{pB.name}</div>
               <div className="text-xs text-gray-400">{tB.name}</div>
-              <div className={`text-3xl font-bold mt-1 ${setB>setA?'text-green-500':setB<setA?'text-red-400':'text-gray-400'}`}>{setB}</div>
+              <div className={"text-3xl font-bold mt-1 " + (setB>setA?'text-green-500':setB<setA?'text-red-400':'text-gray-400')}>{setB}</div>
             </div>
+          </div>
+          <div className="mb-4">
+            <label className="text-sm font-medium text-gray-600 block mb-1">📅 Maç Tarihi</label>
+            <input type="date" value={matchDate} onChange={e=>setMatchDate(e.target.value)}
+              className="border rounded-xl px-3 py-2 w-full text-sm focus:border-amber-400 focus:outline-none"/>
           </div>
           <div className="space-y-2 mb-4">
             {sets.map((s,i)=>(
@@ -632,7 +738,7 @@ function MatchModal({ match, teams, onSave, onClose }) {
                 <span className="text-gray-300 font-bold">—</span>
                 <input type="number" value={s.b} onChange={e=>setVal(i,'b',e.target.value)} min="0" placeholder="0"
                   className="border rounded-lg px-2 py-2 w-16 text-center text-sm focus:border-amber-400 focus:outline-none"/>
-                {sets.length>1 && <button onClick={()=>removeSet(i)} className="text-red-300 hover:text-red-500 text-xl leading-none">×</button>}
+                {sets.length > 2 && <button onClick={()=>removeSet(i)} className="text-red-400 hover:text-red-600 text-xs ml-1">✕</button>}
               </div>
             ))}
             <button onClick={addSet} className="text-amber-500 text-sm hover:text-amber-700 font-medium mt-1">+ Set Ekle</button>
@@ -651,8 +757,8 @@ function MatchModal({ match, teams, onSave, onClose }) {
 
 // ── PlayerModal ────────────────────────────────────
 function PlayerModal({ player, teams, onSave, onClose }) {
-  const teamOfPlayer = teams.find(t=>t.players.some(p=>p.id===player.id));
-  const teamColor = teamOfPlayer?.color || '#999';
+  const team = teams.find(t=>t.players?.some(p=>p.id===player.id)) || teams.find(t=>t.id===player.teamId) || {};
+  const teamColor = team.color || '#999';
   const [name, setName] = useState(player.name||'');
   const [rank, setRank] = useState(player.rank||'B');
   const [photo, setPhoto] = useState(player.photo||'');
@@ -660,7 +766,7 @@ function PlayerModal({ player, teams, onSave, onClose }) {
   const fileRef = useRef();
 
   async function handleFile(e) {
-    const file = e.target.files?.[0]; if(!file) return;
+    const file = e.target.files?.[0]; if (!file) return;
     setPhoto(await compressImage(file));
   }
   async function handleSave() {
@@ -671,8 +777,8 @@ function PlayerModal({ player, teams, onSave, onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm" onClick={e=>e.stopPropagation()}>
         <div className="p-6">
           <h3 className="text-lg font-bold text-gray-800 mb-4">Oyuncu Düzenle</h3>
           <div className="flex flex-col items-center mb-5">
@@ -688,7 +794,7 @@ function PlayerModal({ player, teams, onSave, onClose }) {
               <input value={name} onChange={e=>setName(e.target.value)} className="border rounded-xl px-3 py-2 w-full text-sm focus:border-amber-400 focus:outline-none"/></div>
             <div><label className="text-sm font-medium text-gray-600 block mb-1">Klasman</label>
               <div className="flex gap-2">{RANKS.map(r=>(
-                <button key={r} onClick={()=>setRank(r)} className={`flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all ${rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400 hover:border-gray-300'}`}>{r}</button>
+                <button key={r} onClick={()=>setRank(r)} className={"flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all " + (rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400 hover:border-gray-300')}>{r}</button>
               ))}</div>
             </div>
           </div>
@@ -705,13 +811,13 @@ function PlayerModal({ player, teams, onSave, onClose }) {
 // ── TeamModal ──────────────────────────────────────
 function TeamModal({ team, onSave, onClose }) {
   const [name, setName] = useState(team.name||'');
-  const [color, setColor] = useState(team.color||'#333333');
+  const [color, setColor] = useState(team.color||'#003399');
   const [logo, setLogo] = useState(team.logo||'');
   const [saving, setSaving] = useState(false);
   const fileRef = useRef();
 
   async function handleFile(e) {
-    const file = e.target.files?.[0]; if(!file) return;
+    const file = e.target.files?.[0]; if (!file) return;
     setLogo(await compressImage(file));
   }
   async function handleSave() {
@@ -722,8 +828,8 @@ function TeamModal({ team, onSave, onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm" onClick={e=>e.stopPropagation()}>
         <div className="p-6">
           <h3 className="text-lg font-bold text-gray-800 mb-4">Takım Düzenle</h3>
           <div className="flex flex-col items-center mb-5">
@@ -762,7 +868,7 @@ function AddPlayerModal({ teamId, onSave, onClose }) {
   const fileRef = useRef();
 
   async function handleFile(e) {
-    const file = e.target.files?.[0]; if(!file) return;
+    const file = e.target.files?.[0]; if (!file) return;
     setPhoto(await compressImage(file));
   }
   async function handleSave() {
@@ -773,8 +879,8 @@ function AddPlayerModal({ teamId, onSave, onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm" onClick={e=>e.stopPropagation()}>
         <div className="p-6">
           <h3 className="text-lg font-bold text-gray-800 mb-4">Oyuncu Ekle</h3>
           <div className="flex flex-col items-center mb-5">
@@ -789,7 +895,7 @@ function AddPlayerModal({ teamId, onSave, onClose }) {
               <input value={name} onChange={e=>setName(e.target.value)} placeholder="Oyuncu adı" className="border rounded-xl px-3 py-2 w-full text-sm focus:border-amber-400 focus:outline-none"/></div>
             <div><label className="text-sm font-medium text-gray-600 block mb-1">Klasman</label>
               <div className="flex gap-2">{RANKS.map(r=>(
-                <button key={r} onClick={()=>setRank(r)} className={`flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all ${rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400 hover:border-gray-300'}`}>{r}</button>
+                <button key={r} onClick={()=>setRank(r)} className={"flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all " + (rank===r?'border-amber-500 bg-amber-50 text-amber-700':'border-gray-200 text-gray-400 hover:border-gray-300')}>{r}</button>
               ))}</div>
             </div>
           </div>
@@ -802,3 +908,4 @@ function AddPlayerModal({ teamId, onSave, onClose }) {
     </div>
   );
 }
+// v4 - shuffled fixtures, date support, date-based sorting
